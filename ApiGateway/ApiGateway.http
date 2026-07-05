@@ -1,6 +1,8 @@
-@ApiGateway_HostAddress = http://localhost:5282
+POST http://localhost:8080/api/orders
+Content-Type: application/json
+X-Correlation-ID: final-project-test-12345
 
-GET {{ApiGateway_HostAddress}}/weatherforecast/
-Accept: application/json
-
-###
+{
+  "productId": 1,
+  "quantity": 1
+}

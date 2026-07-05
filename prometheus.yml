@@ -1,0 +1,32 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'api-gateway'
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['apigateway:8080']
+
+  - job_name: 'product-catalog'
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['productcatalogservice:8080']
+
+  - job_name: 'order-service'
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['orderservice:8080']
+
+  - job_name: 'inventory-service'
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['inventoryservice:8080']
+
+  - job_name: 'notification-service'
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['notificationservice:8080']

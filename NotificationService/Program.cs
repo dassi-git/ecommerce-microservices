@@ -1,17 +1,39 @@
-using System.Text;
-using RabbitMQ.Client;
-using RabbitMQ.Client.Events;
+using MassTransit;
+using Shared.Contracts;
+using System.Diagnostics;
 
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddOpenApi();
-builder.Services.AddHealthChecks(); // הוספת בדיקת בריאות
+builder.Services.AddHealthChecks();
+builder.Logging.ClearProviders();
+builder.Logging.AddJsonConsole(options =>
+{
+    options.IncludeScopes = true;
+});
+
+var messagingEnabled = builder.Configuration.GetValue("Messaging:Enabled", false);
 
 var port = Environment.GetEnvironmentVariable("PORT");
 if (!string.IsNullOrWhiteSpace(port))
 {
     builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
 }
+
+builder.Services.AddMassTransit(x =>
+{
+    x.SetKebabCaseEndpointNameFormatter();
+    x.AddConsumer<NotificationConsumer>();
+    x.UsingRabbitMq((context, cfg) =>
+    {
+        cfg.Host("rabbitmq", "/", h =>
+        {
+            h.Username("guest");
+            h.Password("guest");
+        });
+        cfg.ConfigureEndpoints(context);
+    });
+});
 
 var app = builder.Build();
 
@@ -20,48 +42,53 @@ if (app.Environment.IsDevelopment())
     app.MapOpenApi();
 }
 
-app.MapHealthChecks("/health"); // ניתוב בדיקת בריאות
-
-// הפעלת הצרכן (Consumer) ברקע עם מנגנון Retry לחיבור ל-RabbitMQ
-Task.Run(async () =>
+app.Use(async (context, next) =>
 {
-    var factory = new ConnectionFactory { HostName = "rabbitmq", Port = 5672 };
-    IConnection? connection = null;
+    var correlationId = context.Request.Headers["X-Correlation-ID"].ToString()
+        ?? context.Items["CorrelationId"]?.ToString()
+        ?? Guid.NewGuid().ToString("N");
 
-    for (int i = 1; i <= 5; i++)
-    {
-        try
-        {
-            connection = factory.CreateConnection();
-            break;
-        }
-        catch (RabbitMQ.Client.Exceptions.BrokerUnreachableException)
-        {
-            if (i == 5)
-            {
-                Console.WriteLine("NotificationService could not connect to RabbitMQ after 5 attempts.");
-                return;
-            }
-            await Task.Delay(5000);
-        }
-    }
+    context.Items["CorrelationId"] = correlationId;
+    context.Response.Headers["X-Correlation-ID"] = correlationId;
 
-    if (connection != null)
-    {
-        var channel = connection.CreateModel();
-        channel.QueueDeclare(queue: "order-notifications", durable: false, exclusive: false, autoDelete: false, arguments: null);
-
-        var consumer = new EventingBasicConsumer(channel);
-        consumer.Received += (model, ea) =>
-        {
-            var body = ea.Body.ToArray();
-            var message = Encoding.UTF8.GetString(body);
-            Console.WriteLine($"Received notification message: {message}");
-            channel.BasicAck(ea.DeliveryTag, false);
-        };
-
-        channel.BasicConsume(queue: "order-notifications", autoAck: false, consumer: consumer);
-    }
+    using var scope = app.Logger.BeginScope(new Dictionary<string, object?> { ["CorrelationId"] = correlationId });
+    await next();
 });
 
+app.MapGet("/health", () => Results.Ok(new { status = "Healthy", service = "NotificationService" }));
+
 app.Run();
+
+public class NotificationConsumer : IConsumer<OrderCreatedEvent>, IConsumer<InventoryReservedEvent>, IConsumer<InventoryReservationFailedEvent>
+{
+    private readonly ILogger<NotificationConsumer> _logger;
+
+    public NotificationConsumer(ILogger<NotificationConsumer> logger)
+    {
+        _logger = logger;
+    }
+
+    public Task Consume(ConsumeContext<OrderCreatedEvent> context)
+    {
+        var correlationId = context.Headers.Get<string>("X-Correlation-ID") ?? Activity.Current?.TraceId.ToString() ?? "n/a";
+        using var scope = _logger.BeginScope(new Dictionary<string, object?> { ["CorrelationId"] = correlationId });
+        _logger.LogInformation("Notification event OrderCreatedEvent CorrelationId {CorrelationId} OrderId {OrderId} ProductId {ProductId} Quantity {Quantity}", correlationId, context.Message.OrderId, context.Message.ProductId, context.Message.Quantity);
+        return Task.CompletedTask;
+    }
+
+    public Task Consume(ConsumeContext<InventoryReservedEvent> context)
+    {
+        var correlationId = context.Headers.Get<string>("X-Correlation-ID") ?? Activity.Current?.TraceId.ToString() ?? "n/a";
+        using var scope = _logger.BeginScope(new Dictionary<string, object?> { ["CorrelationId"] = correlationId });
+        _logger.LogInformation("Notification event InventoryReservedEvent CorrelationId {CorrelationId} OrderId {OrderId} ProductId {ProductId} Quantity {Quantity}", correlationId, context.Message.OrderId, context.Message.ProductId, context.Message.Quantity);
+        return Task.CompletedTask;
+    }
+
+    public Task Consume(ConsumeContext<InventoryReservationFailedEvent> context)
+    {
+        var correlationId = context.Headers.Get<string>("X-Correlation-ID") ?? Activity.Current?.TraceId.ToString() ?? "n/a";
+        using var scope = _logger.BeginScope(new Dictionary<string, object?> { ["CorrelationId"] = correlationId });
+        _logger.LogWarning("Notification event InventoryReservationFailedEvent CorrelationId {CorrelationId} OrderId {OrderId} ProductId {ProductId} Quantity {Quantity} Reason {Reason}", correlationId, context.Message.OrderId, context.Message.ProductId, context.Message.Quantity, context.Message.Reason);
+        return Task.CompletedTask;
+    }
+}

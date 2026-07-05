@@ -1,18 +1,53 @@
-using System.Net.Http.Json;
-using System.Text;
-using System.Text.Json;
-using RabbitMQ.Client;
+using MassTransit;
+using Microsoft.EntityFrameworkCore;
+using OrderService.Data;
+using OrderService.Models;
+using Shared.Contracts;
+using System.Diagnostics;
 
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddOpenApi();
-builder.Services.AddHttpClient();
-builder.Services.AddHealthChecks(); // הוספת בדיקת בריאות
+builder.Services.AddHealthChecks();
+builder.Logging.ClearProviders();
+builder.Logging.AddJsonConsole(options =>
+{
+    options.IncludeScopes = true;
+});
+
+var messagingEnabled = builder.Configuration.GetValue("Messaging:Enabled", false);
 
 var port = Environment.GetEnvironmentVariable("PORT");
 if (!string.IsNullOrWhiteSpace(port))
 {
     builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
+}
+
+var connectionString = builder.Configuration.GetConnectionString("OrderDb")
+    ?? "Server=sqlserver,1433;Database=OrderDb;User Id=sa;Password=YourStrong!Passw0rd;Encrypt=False;TrustServerCertificate=True;";
+
+builder.Services.AddDbContext<OrderDbContext>(options =>
+    options.UseSqlServer(connectionString));
+
+builder.Services.AddMassTransit(x =>
+{
+    x.SetKebabCaseEndpointNameFormatter();
+    x.AddConsumer<OrderStatusConsumer>();
+
+    x.UsingRabbitMq((context, cfg) =>
+    {
+        cfg.Host("rabbitmq", "/", h =>
+        {
+            h.Username("guest");
+            h.Password("guest");
+        });
+        cfg.ConfigureEndpoints(context);
+    });
+});
+
+if (!messagingEnabled)
+{
+    builder.Logging.AddFilter("Microsoft", LogLevel.Warning);
 }
 
 var app = builder.Build();
@@ -22,86 +57,123 @@ if (app.Environment.IsDevelopment())
     app.MapOpenApi();
 }
 
-app.MapHealthChecks("/health"); // ניתוב בדיקת בריאות
-
-var orders = new List<Order>();
-var nextOrderId = 1;
-
-app.MapGet("/api/orders", () => Results.Ok(orders));
-
-app.MapPost("/api/orders", async (CreateOrderRequest request, HttpClient httpClient) =>
+app.Use(async (context, next) =>
 {
-    // 1. קריאה סינכרונית לניהול המלאי
-    var reserveResponse = await httpClient.PostAsJsonAsync("http://inventoryservice:8080/api/inventory/reserve", new
-    {
-        productId = request.ProductId,
-        quantity = request.Quantity
-    });
+    var correlationId = CorrelationHelpers.GetCorrelationId(context);
+    context.Items["CorrelationId"] = correlationId;
+    context.Response.Headers["X-Correlation-ID"] = correlationId;
 
-    if (!reserveResponse.IsSuccessStatusCode)
-    {
-        return Results.BadRequest("Failed to reserve stock. Order rejected.");
-    }
+    using var scope = app.Logger.BeginScope(new Dictionary<string, object?> { ["CorrelationId"] = correlationId });
+    await next();
+});
 
-    var order = new Order
+app.MapGet("/health", () => Results.Ok(new { status = "Healthy", service = "OrderService" }));
+
+app.MapGet("/api/orders", async (HttpContext httpContext, OrderDbContext db, ILoggerFactory loggerFactory) =>
+{
+    var correlationId = CorrelationHelpers.GetCorrelationId(httpContext);
+    var logger = loggerFactory.CreateLogger("OrderService");
+    logger.LogInformation("Fetching orders for correlation {CorrelationId}", correlationId);
+
+    var orders = await db.Orders.OrderBy(o => o.CreatedAt).ToListAsync();
+    return Results.Ok(orders);
+});
+
+app.MapPost("/api/orders", async (HttpContext httpContext, CreateOrderRequest request, OrderDbContext db, IPublishEndpoint publisher, ILoggerFactory loggerFactory) =>
+{
+    var correlationId = CorrelationHelpers.GetCorrelationId(httpContext);
+    var logger = loggerFactory.CreateLogger("OrderService");
+    logger.LogInformation("Creating order for correlation {CorrelationId} ProductId {ProductId} Quantity {Quantity}", correlationId, request.ProductId, request.Quantity);
+
+    var order = new OrderEntity
     {
-        Id = nextOrderId++,
         ProductId = request.ProductId,
         Quantity = request.Quantity,
-        Status = "Confirmed"
+        Status = "Pending"
     };
-    orders.Add(order);
 
-    // 2. קריאה אסינכרונית ל-RabbitMQ עם מנגנון Retry
-    var factory = new ConnectionFactory { HostName = "rabbitmq", Port = 5672 };
-    IConnection? connection = null;
-    
-    for (int i = 1; i <= 5; i++)
+    db.Orders.Add(order);
+    await db.SaveChangesAsync();
+
+    if (publisher is not null)
     {
-        try
+        await publisher.Publish(new OrderCreatedEvent(order.Id, order.ProductId, order.Quantity, DateTime.UtcNow), context =>
         {
-            connection = factory.CreateConnection();
-            break;
-        }
-        catch (RabbitMQ.Client.Exceptions.BrokerUnreachableException)
-        {
-            if (i == 5) throw;
-            await Task.Delay(5000);
-        }
+            context.Headers.Set("X-Correlation-ID", correlationId);
+        });
+
+        logger.LogInformation("Order {OrderId} published for correlation {CorrelationId}", order.Id, correlationId);
     }
-
-    if (connection != null)
+    else
     {
-        using var channel = connection.CreateModel();
-        channel.QueueDeclare(queue: "order-notifications", durable: false, exclusive: false, autoDelete: false, arguments: null);
-
-        var notificationPayload = new
-        {
-            OrderId = order.Id,
-            Message = $"Order {order.Id} for product {order.ProductId} has been confirmed."
-        };
-
-        var json = JsonSerializer.Serialize(notificationPayload);
-        var body = Encoding.UTF8.GetBytes(json);
-
-        channel.BasicPublish(exchange: string.Empty, routingKey: "order-notifications", basicProperties: null, body: body);
+        logger.LogWarning("Messaging is disabled; order {OrderId} was created without publishing for correlation {CorrelationId}", order.Id, correlationId);
     }
 
     return Results.Created($"/api/orders/{order.Id}", order);
 });
 
-app.Run();
-
-public class Order
+using (var scope = app.Services.CreateScope())
 {
-    public int Id { get; set; }
-    public int ProductId { get; set; }
-    public int Quantity { get; set; }
-    public string Status { get; set; } = "Pending";
+    var orderDb = scope.ServiceProvider.GetRequiredService<OrderDbContext>();
+    await orderDb.Database.EnsureCreatedAsync();
 }
+
+app.Run();
 
 public class CreateOrderRequest
 {
     public int ProductId { get; set; }
     public int Quantity { get; set; }
+}
+
+public static class CorrelationHelpers
+{
+    public static string GetCorrelationId(HttpContext httpContext)
+    {
+        return httpContext.Request.Headers["X-Correlation-ID"].ToString()
+            ?? httpContext.Items["CorrelationId"]?.ToString()
+            ?? Guid.NewGuid().ToString("N");
+    }
+}
+
+public class OrderStatusConsumer : IConsumer<InventoryReservedEvent>, IConsumer<InventoryReservationFailedEvent>
+{
+    private readonly OrderDbContext _db;
+    private readonly ILogger<OrderStatusConsumer> _logger;
+
+    public OrderStatusConsumer(OrderDbContext db, ILogger<OrderStatusConsumer> logger)
+    {
+        _db = db;
+        _logger = logger;
+    }
+
+    public async Task Consume(ConsumeContext<InventoryReservedEvent> context)
+    {
+        var correlationId = context.Headers.Get<string>("X-Correlation-ID") ?? Activity.Current?.TraceId.ToString() ?? "n/a";
+        var order = await _db.Orders.FindAsync(context.Message.OrderId);
+        if (order is null)
+        {
+            _logger.LogWarning("Order {OrderId} not found while handling reservation for correlation {CorrelationId}", context.Message.OrderId, correlationId);
+            return;
+        }
+
+        order.Status = "Confirmed";
+        await _db.SaveChangesAsync();
+        _logger.LogInformation("Order {OrderId} confirmed for correlation {CorrelationId}", order.Id, correlationId);
+    }
+
+    public async Task Consume(ConsumeContext<InventoryReservationFailedEvent> context)
+    {
+        var correlationId = context.Headers.Get<string>("X-Correlation-ID") ?? Activity.Current?.TraceId.ToString() ?? "n/a";
+        var order = await _db.Orders.FindAsync(context.Message.OrderId);
+        if (order is null)
+        {
+            _logger.LogWarning("Order {OrderId} not found while handling failure for correlation {CorrelationId}", context.Message.OrderId, correlationId);
+            return;
+        }
+
+        order.Status = "Rejected";
+        await _db.SaveChangesAsync();
+        _logger.LogInformation("Order {OrderId} rejected for correlation {CorrelationId} because {Reason}", order.Id, correlationId, context.Message.Reason);
+    }
 }

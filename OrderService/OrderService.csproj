@@ -8,7 +8,14 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.9" />
-    <PackageReference Include="RabbitMQ.Client" Version="6.8.1" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.SqlServer" Version="8.0.0" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="8.0.0" />
+    <PackageReference Include="MassTransit.AspNetCore" Version="9.2.0-develop.105" />
+    <PackageReference Include="MassTransit.RabbitMQ" Version="9.2.0-develop.105" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\Shared\Contracts.cs" Link="Shared\Contracts.cs" />
   </ItemGroup>
 
 </Project>

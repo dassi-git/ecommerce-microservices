@@ -1,8 +1,48 @@
 services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "YourStrong!Passw0rd"
+      MSSQL_PID: "Developer"
+    expose:
+      - "1433"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'YourStrong!Passw0rd' -C -Q 'SELECT 1' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+  mongodb:
+    image: mongo:latest
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: admin123
+    expose:
+      - "27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+  redis:
+    image: redis:alpine
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   rabbitmq:
     image: rabbitmq:3-management
+    expose:
+      - "5672"
     ports:
-      - "5672:5672"
       - "15672:15672"
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
@@ -10,24 +50,37 @@ services:
       timeout: 5s
       retries: 10
 
-  redis:
-    image: redis:alpine
+  prometheus:
+    build:
+      context: .
+      dockerfile: ./prometheus.Dockerfile
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    expose:
+      - "9090"
     ports:
-      - "6379:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
 
   apigateway:
     build:
-      context: ./ApiGateway
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: ./ApiGateway/Dockerfile
     depends_on:
-      rabbitmq:
-        condition: service_started
       productcatalogservice:
+        condition: service_started
+      productcatalogservice-replica:
         condition: service_started
       orderservice:
         condition: service_started
@@ -35,83 +88,122 @@ services:
         condition: service_started
       notificationservice:
         condition: service_started
+      rabbitmq:
+        condition: service_started
     ports:
       - "8080:8080"
     environment:
       ASPNETCORE_ENVIRONMENT: Development
       PORT: 8080
+    expose:
+      - "8080"
     healthcheck:
-      test: ["CMD-SHELL", "wget -q --spider http://localhost:8080/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health >/dev/null || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10
 
   productcatalogservice:
     build:
-      context: ./ProductCatalogService
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: ./ProductCatalogService/Dockerfile
     depends_on:
-      rabbitmq:
+      mongodb:
         condition: service_started
       redis:
+        condition: service_started
+      rabbitmq:
         condition: service_started
     environment:
       ASPNETCORE_ENVIRONMENT: Development
       PORT: 8080
-    deploy:
-      replicas: 2
+    expose:
+      - "8080"
     healthcheck:
-      test: ["CMD-SHELL", "wget -q --spider http://localhost:8080/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  productcatalogservice-replica:
+    build:
+      context: .
+      dockerfile: ./ProductCatalogService/Dockerfile
+    depends_on:
+      mongodb:
+        condition: service_started
+      redis:
+        condition: service_started
+      rabbitmq:
+        condition: service_started
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      PORT: 8080
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health >/dev/null || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10
 
   orderservice:
     build:
-      context: ./OrderService
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: ./OrderService/Dockerfile
     depends_on:
-      rabbitmq:
+      sqlserver:
         condition: service_started
-      inventoryservice:
+      rabbitmq:
         condition: service_started
     environment:
       ASPNETCORE_ENVIRONMENT: Development
       PORT: 8080
+    expose:
+      - "8080"
     healthcheck:
-      test: ["CMD-SHELL", "wget -q --spider http://localhost:8080/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health >/dev/null || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10
 
   inventoryservice:
     build:
-      context: ./InventoryService
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: ./InventoryService/Dockerfile
     depends_on:
+      sqlserver:
+        condition: service_started
       rabbitmq:
         condition: service_started
     environment:
       ASPNETCORE_ENVIRONMENT: Development
       PORT: 8080
+    expose:
+      - "8080"
     healthcheck:
-      test: ["CMD-SHELL", "wget -q --spider http://localhost:8080/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health >/dev/null || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10
 
   notificationservice:
     build:
-      context: ./NotificationService
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: ./NotificationService/Dockerfile
     depends_on:
       rabbitmq:
         condition: service_started
     environment:
       ASPNETCORE_ENVIRONMENT: Development
       PORT: 8080
+    expose:
+      - "8080"
     healthcheck:
-      test: ["CMD-SHELL", "wget -q --spider http://localhost:8080/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health >/dev/null || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10
+
+volumes:
+  grafana-data:

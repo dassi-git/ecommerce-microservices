@@ -1,11 +1,13 @@
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
 
-COPY *.csproj ./
-RUN dotnet restore
+COPY ["OrderService/OrderService.csproj", "./OrderService/"]
+COPY ["Shared/", "./Shared/"]
+RUN dotnet restore "./OrderService/OrderService.csproj"
 
-COPY . .
-RUN dotnet publish -c Release -o /app/publish /p:UseAppHost=false
+COPY OrderService/. ./OrderService/
+COPY Shared/. ./Shared/
+RUN dotnet publish "./OrderService/OrderService.csproj" -c Release -o /app/publish /p:UseAppHost=false
 
 FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS final
 WORKDIR /app

@@ -1,11 +1,13 @@
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
 
-COPY *.csproj ./
-RUN dotnet restore
+COPY ["InventoryService/InventoryService.csproj", "./InventoryService/"]
+COPY ["Shared/", "./Shared/"]
+RUN dotnet restore "./InventoryService/InventoryService.csproj"
 
-COPY . .
-RUN dotnet publish -c Release -o /app/publish /p:UseAppHost=false
+COPY InventoryService/. ./InventoryService/
+COPY Shared/. ./Shared/
+RUN dotnet publish "./InventoryService/InventoryService.csproj" -c Release -o /app/publish /p:UseAppHost=false
 
 FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS final
 WORKDIR /app
