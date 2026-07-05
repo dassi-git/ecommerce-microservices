@@ -1,0 +1,7 @@
+POST http://localhost:5019/api/Products/PlaceOrder
+Content-Type: application/json
+
+{
+    "productId": 1,
+    "quantity": 2
+}
