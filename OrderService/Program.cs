@@ -31,20 +31,14 @@ builder.Services.AddDbContext<OrderDbContext>(options =>
 
 builder.Services.AddMassTransit(x =>
 {
-    x.SetKebabCaseEndpointNameFormatter();
-    x.AddConsumer<OrderStatusConsumer>();
-
     x.UsingRabbitMq((context, cfg) =>
     {
-        cfg.Host("rabbitmq", "/", h =>
-        {
+        cfg.Host("rabbitmq", "/", h => {
             h.Username("guest");
             h.Password("guest");
         });
-        cfg.ConfigureEndpoints(context);
     });
 });
-
 if (!messagingEnabled)
 {
     builder.Logging.AddFilter("Microsoft", LogLevel.Warning);
