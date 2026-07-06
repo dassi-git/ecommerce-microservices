@@ -98,7 +98,7 @@ services:
       productcatalogservice:
         condition: service_started
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost/health >/dev/null || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/health >/dev/null || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -121,12 +121,13 @@ services:
     ports:
       - "8080:8080"
     environment:
+      DOTNET_TieredCompilation: "0"
       ASPNETCORE_ENVIRONMENT: Development
       PORT: 8080
     expose:
       - "8080"
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      test: ["CMD-SHELL", "(wget -qO- http://localhost:8080/health >/dev/null 2>&1 || curl -f http://localhost:8080/health >/dev/null 2>&1 || exit 1)"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -135,8 +136,6 @@ services:
     build:
       context: .
       dockerfile: ./ProductCatalogService/Dockerfile
-    deploy:
-      replicas: 2
     depends_on:
       productcatalogmongodb:
         condition: service_healthy
@@ -152,7 +151,31 @@ services:
     expose:
       - "8080"
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      test: ["CMD-SHELL", "(wget -qO- http://localhost:8080/health >/dev/null 2>&1 || curl -f http://localhost:8080/health >/dev/null 2>&1 || exit 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  productcatalogservice-replica:
+    build:
+      context: .
+      dockerfile: ./ProductCatalogService/Dockerfile
+    depends_on:
+      productcatalogmongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      PORT: 8080
+      MongoDb__ConnectionString: mongodb://admin:admin123@productcatalogmongodb:27017
+      MongoDb__DatabaseName: ProductCatalogDb
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD-SHELL", "(wget -qO- http://localhost:8080/health >/dev/null 2>&1 || curl -f http://localhost:8080/health >/dev/null 2>&1 || exit 1)"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -171,11 +194,12 @@ services:
     environment:
       ASPNETCORE_ENVIRONMENT: Development
       PORT: 8080
+      Messaging__Enabled: "true"
       ConnectionStrings__OrderDb: Server=ordersqlserver,1433;Database=OrderDb;User Id=sa;Password=YourStrong!Passw0rd;Encrypt=False;TrustServerCertificate=True;
     expose:
       - "8080"
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      test: ["CMD-SHELL", "(wget -qO- http://localhost:8080/health >/dev/null 2>&1 || curl -f http://localhost:8080/health >/dev/null 2>&1 || exit 1)"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -194,11 +218,12 @@ services:
     environment:
       ASPNETCORE_ENVIRONMENT: Development
       PORT: 8080
+      Messaging__Enabled: "true"
       ConnectionStrings__InventoryDb: Server=inventorysqlserver,1433;Database=InventoryDb;User Id=sa;Password=YourStrong!Passw0rd;Encrypt=False;TrustServerCertificate=True;
     expose:
       - "8080"
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      test: ["CMD-SHELL", "(wget -qO- http://localhost:8080/health >/dev/null 2>&1 || curl -f http://localhost:8080/health >/dev/null 2>&1 || exit 1)"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -216,7 +241,7 @@ services:
     expose:
       - "8080"
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      test: ["CMD-SHELL", "(wget -qO- http://localhost:8080/health >/dev/null 2>&1 || curl -f http://localhost:8080/health >/dev/null 2>&1 || exit 1)"]
       interval: 10s
       timeout: 5s
       retries: 3

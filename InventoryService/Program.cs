@@ -1,6 +1,7 @@
 using InventoryService.Data;
 using InventoryService.Models;
 using MassTransit;
+using Prometheus;
 using Microsoft.EntityFrameworkCore;
 using Serilog;
 using Shared.Contracts;
@@ -21,7 +22,7 @@ builder.Services.AddHealthChecks();
 builder.Logging.ClearProviders();
 builder.Logging.AddSerilog();
 
-var messagingEnabled = builder.Configuration.GetValue("Messaging:Enabled", false);
+var messagingEnabled = builder.Configuration.GetValue("Messaging:Enabled", true);
 
 var port = Environment.GetEnvironmentVariable("PORT");
 if (!string.IsNullOrWhiteSpace(port))
@@ -41,6 +42,7 @@ if (messagingEnabled)
     {
         x.SetKebabCaseEndpointNameFormatter();
         x.AddConsumer<OrderPlacedConsumer>();
+        x.AddConsumer<OrderCancelledConsumer>();
         x.UsingRabbitMq((context, cfg) =>
         {
             cfg.Host("rabbitmq", "/", h =>
@@ -54,6 +56,8 @@ if (messagingEnabled)
 }
 
 var app = builder.Build();
+
+app.UseMetricServer();
 
 if (app.Environment.IsDevelopment())
 {
@@ -151,6 +155,36 @@ public class OrderPlacedConsumer : IConsumer<OrderPlacedEvent>
             {
                 messageContext.Headers.Set("X-Correlation-ID", correlationId);
             });
+        }
+    }
+}
+
+public class OrderCancelledConsumer : IConsumer<OrderCancelledEvent>
+{
+    private readonly InventoryDbContext _db;
+    private readonly ILogger<OrderCancelledConsumer> _logger;
+
+    public OrderCancelledConsumer(InventoryDbContext db, ILogger<OrderCancelledConsumer> logger)
+    {
+        _db = db;
+        _logger = logger;
+    }
+
+    public async Task Consume(ConsumeContext<OrderCancelledEvent> context)
+    {
+        var correlationId = context.Headers.Get<string>("X-Correlation-ID") ?? Activity.Current?.TraceId.ToString() ?? "n/a";
+        using (Serilog.Context.LogContext.PushProperty("CorrelationId", correlationId))
+        {
+            var item = await _db.InventoryItems.FirstOrDefaultAsync(i => i.ProductId == context.Message.ProductId);
+            if (item is null)
+            {
+                _logger.LogWarning("Compensation skipped for order {OrderId}; no inventory item found for correlation {CorrelationId}", context.Message.OrderId, correlationId);
+                return;
+            }
+
+            item.Stock += context.Message.Quantity;
+            await _db.SaveChangesAsync();
+            _logger.LogWarning("Inventory compensation applied for order {OrderId} correlation {CorrelationId}", context.Message.OrderId, correlationId);
         }
     }
 }

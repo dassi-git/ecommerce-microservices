@@ -2,6 +2,7 @@ using MassTransit;
 using Microsoft.EntityFrameworkCore;
 using OrderService.Data;
 using OrderService.Models;
+using Prometheus;
 using Serilog;
 using Serilog.Context;
 using Shared.Contracts;
@@ -22,7 +23,7 @@ builder.Services.AddHealthChecks();
 builder.Logging.ClearProviders();
 builder.Logging.AddSerilog();
 
-var messagingEnabled = builder.Configuration.GetValue("Messaging:Enabled", false);
+var messagingEnabled = builder.Configuration.GetValue("Messaging:Enabled", true);
 
 var port = Environment.GetEnvironmentVariable("PORT");
 if (!string.IsNullOrWhiteSpace(port))
@@ -58,6 +59,8 @@ if (!messagingEnabled)
 
 var app = builder.Build();
 
+app.UseMetricServer();
+
 if (app.Environment.IsDevelopment())
 {
     app.MapOpenApi();
@@ -86,6 +89,21 @@ app.MapGet("/api/orders", async (HttpContext httpContext, OrderDbContext db, ILo
 
     var orders = await db.Orders.OrderBy(o => o.CreatedAt).ToListAsync();
     return Results.Ok(orders);
+});
+
+app.MapGet("/api/orders/{id:int}", async (int id, HttpContext httpContext, OrderDbContext db, ILoggerFactory loggerFactory) =>
+{
+    var correlationId = CorrelationHelpers.GetCorrelationId(httpContext);
+    var logger = loggerFactory.CreateLogger("OrderService");
+    logger.LogInformation("Fetching order {OrderId} for correlation {CorrelationId}", id, correlationId);
+
+    var order = await db.Orders.FirstOrDefaultAsync(o => o.Id == id);
+    if (order is null)
+    {
+        return Results.NotFound(new { message = $"Order {id} was not found." });
+    }
+
+    return Results.Ok(order);
 });
 
 app.MapPost("/api/orders", async (HttpContext httpContext, CreateOrderRequest request, OrderDbContext db, IPublishEndpoint publisher, ILoggerFactory loggerFactory) =>
@@ -123,6 +141,38 @@ app.MapPost("/api/orders", async (HttpContext httpContext, CreateOrderRequest re
     }
 
     return Results.Created($"/api/orders/{order.Id}", order);
+});
+
+app.MapPost("/api/orders/{id:int}/cancel", async (int id, HttpContext httpContext, OrderDbContext db, IPublishEndpoint publisher, ILoggerFactory loggerFactory) =>
+{
+    var correlationId = CorrelationHelpers.GetCorrelationId(httpContext);
+    var logger = loggerFactory.CreateLogger("OrderService");
+    var order = await db.Orders.FirstOrDefaultAsync(o => o.Id == id);
+
+    if (order is null)
+    {
+        return Results.NotFound(new { message = $"Order {id} was not found." });
+    }
+
+    if (order.Status == "Cancelled")
+    {
+        return Results.Ok(order);
+    }
+
+    order.Status = "Cancelled";
+    await db.SaveChangesAsync();
+
+    if (publisher is not null)
+    {
+        await publisher.Publish(new OrderCancelledEvent(order.Id, order.ProductId, order.Quantity, DateTime.UtcNow), context =>
+        {
+            context.Headers.Set("X-Correlation-ID", correlationId);
+        });
+
+        logger.LogWarning("Order {OrderId} cancelled and compensation published for correlation {CorrelationId}", order.Id, correlationId);
+    }
+
+    return Results.Ok(order);
 });
 
 using (var scope = app.Services.CreateScope())
@@ -202,9 +252,9 @@ public class InventoryRejectedConsumer : IConsumer<InventoryRejectedEvent>
                 return;
             }
 
-            order.Status = "Cancelled";
+            order.Status = "Rejected";
             await _db.SaveChangesAsync();
-            _logger.LogInformation("Order {OrderId} cancelled for correlation {CorrelationId} because {Reason}", order.Id, correlationId, context.Message.Reason);
+            _logger.LogWarning("Order {OrderId} rejected for correlation {CorrelationId} because {Reason}", order.Id, correlationId, context.Message.Reason);
         }
     }
 }

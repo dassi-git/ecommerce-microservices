@@ -1,6 +1,7 @@
 using System.Text.Json;
 using Microsoft.Extensions.Caching.Distributed;
 using MongoDB.Bson;
+using Prometheus;
 using MongoDB.Bson.Serialization.Attributes;
 using MongoDB.Driver;
 using Serilog;
@@ -44,6 +45,8 @@ if (!string.IsNullOrWhiteSpace(port))
 
 var app = builder.Build();
 
+app.UseMetricServer();
+
 if (app.Environment.IsDevelopment())
 {
     app.MapOpenApi();
@@ -75,8 +78,10 @@ app.MapGet("/api/products", async (HttpContext httpContext, IMongoCollection<Pro
     return Results.Ok(products.Select(product => new ProductDto(product.Id ?? string.Empty, product.Name, product.Price, product.Stock)));
 });
 
-app.MapGet("/api/products/{id}", async (string id, IMongoCollection<Product> productsCollection, IDistributedCache cache) =>
+app.MapGet("/api/products/{id}", async (string id, HttpContext httpContext, IMongoCollection<Product> productsCollection, IDistributedCache cache, ILoggerFactory loggerFactory) =>
 {
+    var correlationId = CorrelationHelpers.GetCorrelationId(httpContext);
+    var logger = loggerFactory.CreateLogger("ProductCatalogService");
     var cacheKey = $"product:{id}";
     var cachedValue = await cache.GetStringAsync(cacheKey);
 
@@ -85,9 +90,12 @@ app.MapGet("/api/products/{id}", async (string id, IMongoCollection<Product> pro
         var cachedProduct = JsonSerializer.Deserialize<ProductDto>(cachedValue);
         if (cachedProduct is not null)
         {
+            logger.LogInformation("Product catalog cache hit for {ProductId} correlation {CorrelationId}", id, correlationId);
             return Results.Ok(cachedProduct);
         }
     }
+
+    logger.LogInformation("Product catalog cache miss for {ProductId} correlation {CorrelationId}", id, correlationId);
 
     var product = await productsCollection.Find(p => p.Id == id).FirstOrDefaultAsync();
     if (product is null)
@@ -122,6 +130,24 @@ app.MapPost("/api/products", async (CreateProductRequest request, IMongoCollecti
     return Results.Created($"/api/products/{product.Id}", productDto);
 });
 
+app.MapPut("/api/products/{id}", async (string id, UpdateProductRequest request, IMongoCollection<Product> productsCollection, IDistributedCache cache) =>
+{
+    var existingProduct = await productsCollection.Find(p => p.Id == id).FirstOrDefaultAsync();
+    if (existingProduct is null)
+    {
+        return Results.NotFound();
+    }
+
+    existingProduct.Name = request.Name;
+    existingProduct.Price = request.Price;
+    existingProduct.Stock = request.Stock;
+
+    await productsCollection.ReplaceOneAsync(p => p.Id == id, existingProduct);
+    await cache.RemoveAsync($"product:{id}");
+
+    return Results.Ok(new ProductDto(existingProduct.Id ?? string.Empty, existingProduct.Name, existingProduct.Price, existingProduct.Stock));
+});
+
 using (var scope = app.Services.CreateScope())
 {
     var productsCollection = scope.ServiceProvider.GetRequiredService<IMongoCollection<Product>>();
@@ -153,6 +179,13 @@ public class Product
 public record ProductDto(string Id, string Name, decimal Price, int Stock);
 
 public class CreateProductRequest
+{
+    public string Name { get; set; } = string.Empty;
+    public decimal Price { get; set; }
+    public int Stock { get; set; }
+}
+
+public class UpdateProductRequest
 {
     public string Name { get; set; } = string.Empty;
     public decimal Price { get; set; }

@@ -1,4 +1,5 @@
 using MassTransit;
+using Prometheus;
 using Serilog;
 using Shared.Contracts;
 using System.Diagnostics;
@@ -18,7 +19,7 @@ builder.Services.AddHealthChecks();
 builder.Logging.ClearProviders();
 builder.Logging.AddSerilog();
 
-var messagingEnabled = builder.Configuration.GetValue("Messaging:Enabled", false);
+var messagingEnabled = builder.Configuration.GetValue("Messaging:Enabled", true);
 
 var port = Environment.GetEnvironmentVariable("PORT");
 if (!string.IsNullOrWhiteSpace(port))
@@ -30,6 +31,8 @@ builder.Services.AddMassTransit(x =>
 {
     x.SetKebabCaseEndpointNameFormatter();
     x.AddConsumer<OrderPlacedConsumer>();
+    x.AddConsumer<InventoryReservedConsumer>();
+    x.AddConsumer<InventoryRejectedConsumer>();
     x.UsingRabbitMq((context, cfg) =>
     {
         var rabbitHost = builder.Configuration["RabbitMQ:Host"]
@@ -48,6 +51,8 @@ builder.Services.AddMassTransit(x =>
 });
 
 var app = builder.Build();
+
+app.UseMetricServer();
 
 if (app.Environment.IsDevelopment())
 {
@@ -88,7 +93,49 @@ public class OrderPlacedConsumer : IConsumer<OrderPlacedEvent>
         var correlationId = context.Headers.Get<string>("X-Correlation-ID") ?? Activity.Current?.TraceId.ToString() ?? "n/a";
         using (Serilog.Context.LogContext.PushProperty("CorrelationId", correlationId))
         {
-            _logger.LogInformation("Notification Sent: Order {OrderId} has been placed successfully for correlation {CorrelationId}", context.Message.OrderId, correlationId);
+            _logger.LogInformation("Notification Sent: Order {OrderId} accepted and queued for processing for correlation {CorrelationId}", context.Message.OrderId, correlationId);
+        }
+
+        return Task.CompletedTask;
+    }
+}
+
+public class InventoryReservedConsumer : IConsumer<InventoryReservedEvent>
+{
+    private readonly ILogger<InventoryReservedConsumer> _logger;
+
+    public InventoryReservedConsumer(ILogger<InventoryReservedConsumer> logger)
+    {
+        _logger = logger;
+    }
+
+    public Task Consume(ConsumeContext<InventoryReservedEvent> context)
+    {
+        var correlationId = context.Headers.Get<string>("X-Correlation-ID") ?? Activity.Current?.TraceId.ToString() ?? "n/a";
+        using (Serilog.Context.LogContext.PushProperty("CorrelationId", correlationId))
+        {
+            _logger.LogInformation("Notification Sent: Order {OrderId} was confirmed and inventory was reserved for correlation {CorrelationId}", context.Message.OrderId, correlationId);
+        }
+
+        return Task.CompletedTask;
+    }
+}
+
+public class InventoryRejectedConsumer : IConsumer<InventoryRejectedEvent>
+{
+    private readonly ILogger<InventoryRejectedConsumer> _logger;
+
+    public InventoryRejectedConsumer(ILogger<InventoryRejectedConsumer> logger)
+    {
+        _logger = logger;
+    }
+
+    public Task Consume(ConsumeContext<InventoryRejectedEvent> context)
+    {
+        var correlationId = context.Headers.Get<string>("X-Correlation-ID") ?? Activity.Current?.TraceId.ToString() ?? "n/a";
+        using (Serilog.Context.LogContext.PushProperty("CorrelationId", correlationId))
+        {
+            _logger.LogWarning("Notification Sent: Order {OrderId} was rejected because {Reason} for correlation {CorrelationId}", context.Message.OrderId, context.Message.Reason, correlationId);
         }
 
         return Task.CompletedTask;

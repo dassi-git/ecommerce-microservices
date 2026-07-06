@@ -1,5 +1,6 @@
 using System.Net.Http.Json;
 using Microsoft.Extensions.Primitives;
+using Prometheus;
 using Serilog;
 using Serilog.Context;
 
@@ -16,6 +17,7 @@ builder.Host.UseSerilog();
 builder.Services.AddOpenApi();
 builder.Services.AddHealthChecks();
 builder.Services.AddHttpContextAccessor();
+builder.Services.AddTransient<CorrelationForwardingHandler>();
 builder.Services.AddHttpClient("downstream")
     .AddHttpMessageHandler<CorrelationForwardingHandler>();
 builder.Logging.ClearProviders();
@@ -24,6 +26,8 @@ builder.Services.AddReverseProxy()
     .LoadFromConfig(builder.Configuration.GetSection("ReverseProxy"));
 
 var app = builder.Build();
+
+app.UseMetricServer();
 
 if (app.Environment.IsDevelopment())
 {
@@ -62,9 +66,12 @@ app.MapGet("/api/bff/dashboard", async (HttpContext httpContext, IHttpClientFact
     using var inventoryRequest = new HttpRequestMessage(HttpMethod.Get, "http://inventoryservice:8080/api/inventory");
     inventoryRequest.Headers.TryAddWithoutValidation("X-Correlation-ID", correlationId);
 
-    var ordersResponse = await client.SendAsync(ordersRequest);
+    var ordersTask = client.SendAsync(ordersRequest);
+    var inventoryTask = client.SendAsync(inventoryRequest);
+
+    var ordersResponse = await ordersTask;
     ordersResponse.EnsureSuccessStatusCode();
-    var inventoryResponse = await client.SendAsync(inventoryRequest);
+    var inventoryResponse = await inventoryTask;
     inventoryResponse.EnsureSuccessStatusCode();
 
     var activeOrders = await ordersResponse.Content.ReadFromJsonAsync<List<OrderSummary>>();
