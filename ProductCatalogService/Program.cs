@@ -3,16 +3,22 @@ using Microsoft.Extensions.Caching.Distributed;
 using MongoDB.Bson;
 using MongoDB.Bson.Serialization.Attributes;
 using MongoDB.Driver;
+using Serilog;
 
 var builder = WebApplication.CreateBuilder(args);
+
+Log.Logger = new LoggerConfiguration()
+    .Enrich.FromLogContext()
+    .Enrich.WithProperty("Application", "ProductCatalogService")
+    .WriteTo.Console()
+    .CreateLogger();
+
+builder.Host.UseSerilog();
 
 builder.Services.AddOpenApi();
 builder.Services.AddHealthChecks();
 builder.Logging.ClearProviders();
-builder.Logging.AddJsonConsole(options =>
-{
-    options.IncludeScopes = true;
-});
+builder.Logging.AddSerilog();
 
 var mongoConnectionString = builder.Configuration.GetConnectionString("MongoConnection")
     ?? builder.Configuration["MongoDb:ConnectionString"]
@@ -50,11 +56,14 @@ app.Use(async (context, next) =>
     context.Response.Headers["X-Correlation-ID"] = correlationId;
     context.Response.Headers["X-Container-ID"] = Environment.MachineName;
 
-    using var scope = app.Logger.BeginScope(new Dictionary<string, object?> { ["CorrelationId"] = correlationId });
-    await next();
+    using (Serilog.Context.LogContext.PushProperty("CorrelationId", correlationId))
+    {
+        using var scope = app.Logger.BeginScope(new Dictionary<string, object?> { ["CorrelationId"] = correlationId });
+        await next();
+    }
 });
 
-app.MapGet("/health", () => Results.Ok(new { status = "Healthy", service = "ProductCatalogService" }));
+app.MapHealthChecks("/health");
 
 app.MapGet("/api/products", async (HttpContext httpContext, IMongoCollection<Product> productsCollection, ILoggerFactory loggerFactory) =>
 {

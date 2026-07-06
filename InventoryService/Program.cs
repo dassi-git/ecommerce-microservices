@@ -2,18 +2,24 @@ using InventoryService.Data;
 using InventoryService.Models;
 using MassTransit;
 using Microsoft.EntityFrameworkCore;
+using Serilog;
 using Shared.Contracts;
 using System.Diagnostics;
 
 var builder = WebApplication.CreateBuilder(args);
 
+Log.Logger = new LoggerConfiguration()
+    .Enrich.FromLogContext()
+    .Enrich.WithProperty("Application", "InventoryService")
+    .WriteTo.Console()
+    .CreateLogger();
+
+builder.Host.UseSerilog();
+
 builder.Services.AddOpenApi();
 builder.Services.AddHealthChecks();
 builder.Logging.ClearProviders();
-builder.Logging.AddJsonConsole(options =>
-{
-    options.IncludeScopes = true;
-});
+builder.Logging.AddSerilog();
 
 var messagingEnabled = builder.Configuration.GetValue("Messaging:Enabled", false);
 
@@ -60,11 +66,14 @@ app.Use(async (context, next) =>
     context.Items["CorrelationId"] = correlationId;
     context.Response.Headers["X-Correlation-ID"] = correlationId;
 
-    using var scope = app.Logger.BeginScope(new Dictionary<string, object?> { ["CorrelationId"] = correlationId });
-    await next();
+    using (Serilog.Context.LogContext.PushProperty("CorrelationId", correlationId))
+    {
+        using var scope = app.Logger.BeginScope(new Dictionary<string, object?> { ["CorrelationId"] = correlationId });
+        await next();
+    }
 });
 
-app.MapGet("/health", () => Results.Ok(new { status = "Healthy", service = "InventoryService" }));
+app.MapHealthChecks("/health");
 
 app.MapGet("/api/inventory", async (HttpContext httpContext, InventoryDbContext db, ILoggerFactory loggerFactory) =>
 {
@@ -121,24 +130,27 @@ public class OrderPlacedConsumer : IConsumer<OrderPlacedEvent>
     public async Task Consume(ConsumeContext<OrderPlacedEvent> context)
     {
         var correlationId = context.Headers.Get<string>("X-Correlation-ID") ?? Activity.Current?.TraceId.ToString() ?? "n/a";
-        var item = await _db.InventoryItems.FirstOrDefaultAsync(i => i.ProductId == context.Message.ProductId);
-
-        if (item is null || item.Stock < context.Message.Quantity)
+        using (Serilog.Context.LogContext.PushProperty("CorrelationId", correlationId))
         {
-            _logger.LogWarning("Inventory reservation failed for order {OrderId} correlation {CorrelationId}", context.Message.OrderId, correlationId);
-            await _publisher.Publish(new InventoryRejectedEvent(context.Message.OrderId, context.Message.ProductId, context.Message.Quantity, "Insufficient stock", DateTime.UtcNow), messageContext =>
+            var item = await _db.InventoryItems.FirstOrDefaultAsync(i => i.ProductId == context.Message.ProductId);
+
+            if (item is null || item.Stock < context.Message.Quantity)
+            {
+                _logger.LogWarning("Inventory reservation failed for order {OrderId} correlation {CorrelationId}", context.Message.OrderId, correlationId);
+                await _publisher.Publish(new InventoryRejectedEvent(context.Message.OrderId, context.Message.ProductId, context.Message.Quantity, "Insufficient stock", DateTime.UtcNow), messageContext =>
+                {
+                    messageContext.Headers.Set("X-Correlation-ID", correlationId);
+                });
+                return;
+            }
+
+            item.Stock -= context.Message.Quantity;
+            await _db.SaveChangesAsync();
+            _logger.LogInformation("Inventory reserved for order {OrderId} correlation {CorrelationId}", context.Message.OrderId, correlationId);
+            await _publisher.Publish(new InventoryReservedEvent(context.Message.OrderId, context.Message.ProductId, context.Message.Quantity, DateTime.UtcNow), messageContext =>
             {
                 messageContext.Headers.Set("X-Correlation-ID", correlationId);
             });
-            return;
         }
-
-        item.Stock -= context.Message.Quantity;
-        await _db.SaveChangesAsync();
-        _logger.LogInformation("Inventory reserved for order {OrderId} correlation {CorrelationId}", context.Message.OrderId, correlationId);
-        await _publisher.Publish(new InventoryReservedEvent(context.Message.OrderId, context.Message.ProductId, context.Message.Quantity, DateTime.UtcNow), messageContext =>
-        {
-            messageContext.Headers.Set("X-Correlation-ID", correlationId);
-        });
     }
 }

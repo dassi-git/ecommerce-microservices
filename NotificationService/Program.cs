@@ -1,16 +1,22 @@
 using MassTransit;
+using Serilog;
 using Shared.Contracts;
 using System.Diagnostics;
 
 var builder = WebApplication.CreateBuilder(args);
 
+Log.Logger = new LoggerConfiguration()
+    .Enrich.FromLogContext()
+    .Enrich.WithProperty("Application", "NotificationService")
+    .WriteTo.Console()
+    .CreateLogger();
+
+builder.Host.UseSerilog();
+
 builder.Services.AddOpenApi();
 builder.Services.AddHealthChecks();
 builder.Logging.ClearProviders();
-builder.Logging.AddJsonConsole(options =>
-{
-    options.IncludeScopes = true;
-});
+builder.Logging.AddSerilog();
 
 var messagingEnabled = builder.Configuration.GetValue("Messaging:Enabled", false);
 
@@ -57,11 +63,14 @@ app.Use(async (context, next) =>
     context.Items["CorrelationId"] = correlationId;
     context.Response.Headers["X-Correlation-ID"] = correlationId;
 
-    using var scope = app.Logger.BeginScope(new Dictionary<string, object?> { ["CorrelationId"] = correlationId });
-    await next();
+    using (Serilog.Context.LogContext.PushProperty("CorrelationId", correlationId))
+    {
+        using var scope = app.Logger.BeginScope(new Dictionary<string, object?> { ["CorrelationId"] = correlationId });
+        await next();
+    }
 });
 
-app.MapGet("/health", () => Results.Ok(new { status = "Healthy", service = "NotificationService" }));
+app.MapHealthChecks("/health");
 
 app.Run();
 
@@ -76,7 +85,12 @@ public class OrderPlacedConsumer : IConsumer<OrderPlacedEvent>
 
     public Task Consume(ConsumeContext<OrderPlacedEvent> context)
     {
-        _logger.LogInformation("Notification Sent: Order {OrderId} has been placed successfully", context.Message.Id);
+        var correlationId = context.Headers.Get<string>("X-Correlation-ID") ?? Activity.Current?.TraceId.ToString() ?? "n/a";
+        using (Serilog.Context.LogContext.PushProperty("CorrelationId", correlationId))
+        {
+            _logger.LogInformation("Notification Sent: Order {OrderId} has been placed successfully for correlation {CorrelationId}", context.Message.OrderId, correlationId);
+        }
+
         return Task.CompletedTask;
     }
 }
