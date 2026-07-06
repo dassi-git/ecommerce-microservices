@@ -1,7 +1,17 @@
 using System.Net.Http.Json;
 using Microsoft.Extensions.Primitives;
+using Serilog;
+using Serilog.Context;
 
 var builder = WebApplication.CreateBuilder(args);
+
+Log.Logger = new LoggerConfiguration()
+    .Enrich.FromLogContext()
+    .Enrich.WithProperty("Application", "ApiGateway")
+    .WriteTo.Console()
+    .CreateLogger();
+
+builder.Host.UseSerilog();
 
 builder.Services.AddOpenApi();
 builder.Services.AddHealthChecks();
@@ -9,10 +19,7 @@ builder.Services.AddHttpContextAccessor();
 builder.Services.AddHttpClient("downstream")
     .AddHttpMessageHandler<CorrelationForwardingHandler>();
 builder.Logging.ClearProviders();
-builder.Logging.AddJsonConsole(options =>
-{
-    options.IncludeScopes = true;
-});
+builder.Logging.AddSerilog();
 builder.Services.AddReverseProxy()
     .LoadFromConfig(builder.Configuration.GetSection("ReverseProxy"));
 
@@ -33,8 +40,11 @@ app.Use(async (context, next) =>
     context.Response.Headers["X-Correlation-ID"] = correlationId;
     context.Request.Headers["X-Correlation-ID"] = correlationId;
 
-    using var scope = app.Logger.BeginScope(new Dictionary<string, object?> { ["CorrelationId"] = correlationId });
-    await next();
+    using (LogContext.PushProperty("CorrelationId", correlationId))
+    {
+        using var scope = app.Logger.BeginScope(new Dictionary<string, object?> { ["CorrelationId"] = correlationId });
+        await next();
+    }
 });
 
 app.MapHealthChecks("/health");
@@ -71,12 +81,62 @@ app.MapGet("/api/bff/dashboard", async (HttpContext httpContext, IHttpClientFact
     });
 });
 
+app.MapGet("/api/bff/order-details/{id:int}", async (int id, HttpContext httpContext, IHttpClientFactory httpClientFactory) =>
+{
+    var correlationId = httpContext.Items["CorrelationId"]?.ToString()
+        ?? httpContext.Request.Headers["X-Correlation-ID"].ToString()
+        ?? Guid.NewGuid().ToString("N");
+
+    var client = httpClientFactory.CreateClient("downstream");
+
+    using var orderRequest = new HttpRequestMessage(HttpMethod.Get, $"http://orderservice:8080/api/orders/{id}");
+    orderRequest.Headers.TryAddWithoutValidation("X-Correlation-ID", correlationId);
+
+    var orderResponse = await client.SendAsync(orderRequest);
+    if (!orderResponse.IsSuccessStatusCode)
+    {
+        return Results.NotFound(new {message = $"Order {id} was not found." });
+    }
+
+    var order = await orderResponse.Content.ReadFromJsonAsync<OrderSummary>();
+    if (order is null)
+    {
+        return Results.NotFound(new { message = $"Order {id} was not found." });
+    }
+
+    using var productRequest = new HttpRequestMessage(HttpMethod.Get, $"http://productcatalogservice:8080/api/products/{order.ProductId}");
+    productRequest.Headers.TryAddWithoutValidation("X-Correlation-ID", correlationId);
+
+    var productResponse = await client.SendAsync(productRequest);
+    if (!productResponse.IsSuccessStatusCode)
+    {
+        return Results.Ok(new
+        {
+            CorrelationId = correlationId,
+            Order = order,
+            Product = (object?)null
+        });
+    }
+
+    var product = await productResponse.Content.ReadFromJsonAsync<ProductSummary>();
+
+    app.Logger.LogInformation("BFF order details prepared for order {OrderId} correlation {CorrelationId}", id, correlationId);
+
+    return Results.Ok(new
+    {
+        CorrelationId = correlationId,
+        Order = order,
+        Product = product
+    });
+});
+
 app.MapReverseProxy();
 
 app.Run();
 
 public record OrderSummary(int Id, int ProductId, int Quantity, string Status, DateTime CreatedAt);
 public record InventorySummary(int ProductId, string Name, int Stock);
+public record ProductSummary(string Id, string Name, decimal Price, int Stock);
 
 public sealed class CorrelationForwardingHandler : DelegatingHandler
 {
@@ -97,6 +157,11 @@ public sealed class CorrelationForwardingHandler : DelegatingHandler
         if (!request.Headers.Contains("X-Correlation-ID"))
         {
             request.Headers.TryAddWithoutValidation("X-Correlation-ID", correlationId);
+        }
+
+        if (httpContext is not null)
+        {
+            request.Options.Set(new HttpRequestOptionsKey<string>("CorrelationId"), correlationId);
         }
 
         return base.SendAsync(request, cancellationToken);

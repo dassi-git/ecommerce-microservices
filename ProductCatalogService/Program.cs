@@ -1,3 +1,5 @@
+using System.Text.Json;
+using Microsoft.Extensions.Caching.Distributed;
 using MongoDB.Bson;
 using MongoDB.Bson.Serialization.Attributes;
 using MongoDB.Driver;
@@ -12,15 +14,21 @@ builder.Logging.AddJsonConsole(options =>
     options.IncludeScopes = true;
 });
 
-var mongoConnectionString = builder.Configuration["MongoDb:ConnectionString"]
-    ?? "mongodb://admin:admin123@mongodb:27017";
+var mongoConnectionString = builder.Configuration.GetConnectionString("MongoConnection")
+    ?? builder.Configuration["MongoDb:ConnectionString"]
+    ?? "mongodb://admin:admin123@productcatalogmongodb:27017";
 var databaseName = builder.Configuration["MongoDb:DatabaseName"] ?? "ProductCatalogDb";
 
 builder.Services.AddSingleton<IMongoClient>(_ => new MongoClient(mongoConnectionString));
 builder.Services.AddSingleton<IMongoDatabase>(sp =>
     sp.GetRequiredService<IMongoClient>().GetDatabase(databaseName));
-builder.Services.AddSingleton<IMongoCollection<ProductDocument>>(sp =>
-    sp.GetRequiredService<IMongoDatabase>().GetCollection<ProductDocument>("products"));
+builder.Services.AddSingleton<IMongoCollection<Product>>(sp =>
+    sp.GetRequiredService<IMongoDatabase>().GetCollection<Product>("products"));
+builder.Services.AddStackExchangeRedisCache(options =>
+{
+    options.Configuration = builder.Configuration.GetConnectionString("Redis") ?? "redis:6379";
+    options.InstanceName = "productcatalog:";
+});
 
 var port = Environment.GetEnvironmentVariable("PORT");
 if (!string.IsNullOrWhiteSpace(port))
@@ -40,6 +48,7 @@ app.Use(async (context, next) =>
     var correlationId = CorrelationHelpers.GetCorrelationId(context);
     context.Items["CorrelationId"] = correlationId;
     context.Response.Headers["X-Correlation-ID"] = correlationId;
+    context.Response.Headers["X-Container-ID"] = Environment.MachineName;
 
     using var scope = app.Logger.BeginScope(new Dictionary<string, object?> { ["CorrelationId"] = correlationId });
     await next();
@@ -47,25 +56,49 @@ app.Use(async (context, next) =>
 
 app.MapGet("/health", () => Results.Ok(new { status = "Healthy", service = "ProductCatalogService" }));
 
-app.MapGet("/api/products", async (HttpContext httpContext, IMongoCollection<ProductDocument> productsCollection, ILoggerFactory loggerFactory) =>
+app.MapGet("/api/products", async (HttpContext httpContext, IMongoCollection<Product> productsCollection, ILoggerFactory loggerFactory) =>
 {
     var correlationId = CorrelationHelpers.GetCorrelationId(httpContext);
     var logger = loggerFactory.CreateLogger("ProductCatalogService");
     logger.LogInformation("Products requested for correlation {CorrelationId}", correlationId);
 
-    var products = await productsCollection.Find(FilterDefinition<ProductDocument>.Empty).ToListAsync();
+    var products = await productsCollection.Find(FilterDefinition<Product>.Empty).ToListAsync();
     return Results.Ok(products.Select(product => new ProductDto(product.Id ?? string.Empty, product.Name, product.Price, product.Stock)));
 });
 
-app.MapGet("/api/products/{id}", async (string id, IMongoCollection<ProductDocument> productsCollection) =>
+app.MapGet("/api/products/{id}", async (string id, IMongoCollection<Product> productsCollection, IDistributedCache cache) =>
 {
+    var cacheKey = $"product:{id}";
+    var cachedValue = await cache.GetStringAsync(cacheKey);
+
+    if (!string.IsNullOrEmpty(cachedValue))
+    {
+        var cachedProduct = JsonSerializer.Deserialize<ProductDto>(cachedValue);
+        if (cachedProduct is not null)
+        {
+            return Results.Ok(cachedProduct);
+        }
+    }
+
     var product = await productsCollection.Find(p => p.Id == id).FirstOrDefaultAsync();
-    return product is null ? Results.NotFound() : Results.Ok(new ProductDto(product.Id ?? string.Empty, product.Name, product.Price, product.Stock));
+    if (product is null)
+    {
+        return Results.NotFound();
+    }
+
+    var productDto = new ProductDto(product.Id ?? string.Empty, product.Name, product.Price, product.Stock);
+    var payload = JsonSerializer.Serialize(productDto);
+    await cache.SetStringAsync(cacheKey, payload, new DistributedCacheEntryOptions
+    {
+        AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(5)
+    });
+
+    return Results.Ok(productDto);
 });
 
-app.MapPost("/api/products", async (CreateProductRequest request, IMongoCollection<ProductDocument> productsCollection) =>
+app.MapPost("/api/products", async (CreateProductRequest request, IMongoCollection<Product> productsCollection, IDistributedCache cache) =>
 {
-    var product = new ProductDocument
+    var product = new Product
     {
         Name = request.Name,
         Price = request.Price,
@@ -73,28 +106,32 @@ app.MapPost("/api/products", async (CreateProductRequest request, IMongoCollecti
     };
 
     await productsCollection.InsertOneAsync(product);
-    return Results.Created($"/api/products/{product.Id}", new ProductDto(product.Id ?? string.Empty, product.Name, product.Price, product.Stock));
+    var productDto = new ProductDto(product.Id ?? string.Empty, product.Name, product.Price, product.Stock);
+
+    await cache.RemoveAsync($"product:{product.Id}");
+
+    return Results.Created($"/api/products/{product.Id}", productDto);
 });
 
 using (var scope = app.Services.CreateScope())
 {
-    var productsCollection = scope.ServiceProvider.GetRequiredService<IMongoCollection<ProductDocument>>();
-    var existingProducts = await productsCollection.CountDocumentsAsync(FilterDefinition<ProductDocument>.Empty);
+    var productsCollection = scope.ServiceProvider.GetRequiredService<IMongoCollection<Product>>();
+    var existingProducts = await productsCollection.CountDocumentsAsync(FilterDefinition<Product>.Empty);
 
     if (existingProducts == 0)
     {
         await productsCollection.InsertManyAsync(
         [
-            new ProductDocument { Name = "Laptop", Price = 999.99m, Stock = 12 },
-            new ProductDocument { Name = "Mouse", Price = 29.99m, Stock = 50 },
-            new ProductDocument { Name = "Keyboard", Price = 79.99m, Stock = 30 }
+            new Product { Name = "Laptop", Price = 999.99m, Stock = 12 },
+            new Product { Name = "Mouse", Price = 29.99m, Stock = 50 },
+            new Product { Name = "Keyboard", Price = 79.99m, Stock = 30 }
         ]);
     }
 }
 
 app.Run();
 
-public class ProductDocument
+public class Product
 {
     [BsonId]
     [BsonRepresentation(BsonType.ObjectId)]

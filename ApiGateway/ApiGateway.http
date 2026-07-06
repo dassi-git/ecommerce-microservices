@@ -1,5 +1,5 @@
-POST http://localhost:8080/api/orders
-Content-Type: application/json
+
+POST http://localhost:[8080]/api/ordersContent-Type: application/json
 X-Correlation-ID: final-project-test-12345
 
 {

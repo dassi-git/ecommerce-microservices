@@ -23,13 +23,19 @@ if (!string.IsNullOrWhiteSpace(port))
 builder.Services.AddMassTransit(x =>
 {
     x.SetKebabCaseEndpointNameFormatter();
-    x.AddConsumer<NotificationConsumer>();
+    x.AddConsumer<OrderPlacedConsumer>();
     x.UsingRabbitMq((context, cfg) =>
     {
-        cfg.Host("rabbitmq", "/", h =>
+        var rabbitHost = builder.Configuration["RabbitMQ:Host"]
+            ?? builder.Configuration["RabbitMq:Host"]
+            ?? "rabbitmq";
+        var rabbitUsername = builder.Configuration["RabbitMQ:Username"] ?? "guest";
+        var rabbitPassword = builder.Configuration["RabbitMQ:Password"] ?? "guest";
+
+        cfg.Host(rabbitHost, "/", h =>
         {
-            h.Username("guest");
-            h.Password("guest");
+            h.Username(rabbitUsername);
+            h.Password(rabbitPassword);
         });
         cfg.ConfigureEndpoints(context);
     });
@@ -59,36 +65,18 @@ app.MapGet("/health", () => Results.Ok(new { status = "Healthy", service = "Noti
 
 app.Run();
 
-public class NotificationConsumer : IConsumer<OrderCreatedEvent>, IConsumer<InventoryReservedEvent>, IConsumer<InventoryReservationFailedEvent>
+public class OrderPlacedConsumer : IConsumer<OrderPlacedEvent>
 {
-    private readonly ILogger<NotificationConsumer> _logger;
+    private readonly ILogger<OrderPlacedConsumer> _logger;
 
-    public NotificationConsumer(ILogger<NotificationConsumer> logger)
+    public OrderPlacedConsumer(ILogger<OrderPlacedConsumer> logger)
     {
         _logger = logger;
     }
 
-    public Task Consume(ConsumeContext<OrderCreatedEvent> context)
+    public Task Consume(ConsumeContext<OrderPlacedEvent> context)
     {
-        var correlationId = context.Headers.Get<string>("X-Correlation-ID") ?? Activity.Current?.TraceId.ToString() ?? "n/a";
-        using var scope = _logger.BeginScope(new Dictionary<string, object?> { ["CorrelationId"] = correlationId });
-        _logger.LogInformation("Notification event OrderCreatedEvent CorrelationId {CorrelationId} OrderId {OrderId} ProductId {ProductId} Quantity {Quantity}", correlationId, context.Message.OrderId, context.Message.ProductId, context.Message.Quantity);
-        return Task.CompletedTask;
-    }
-
-    public Task Consume(ConsumeContext<InventoryReservedEvent> context)
-    {
-        var correlationId = context.Headers.Get<string>("X-Correlation-ID") ?? Activity.Current?.TraceId.ToString() ?? "n/a";
-        using var scope = _logger.BeginScope(new Dictionary<string, object?> { ["CorrelationId"] = correlationId });
-        _logger.LogInformation("Notification event InventoryReservedEvent CorrelationId {CorrelationId} OrderId {OrderId} ProductId {ProductId} Quantity {Quantity}", correlationId, context.Message.OrderId, context.Message.ProductId, context.Message.Quantity);
-        return Task.CompletedTask;
-    }
-
-    public Task Consume(ConsumeContext<InventoryReservationFailedEvent> context)
-    {
-        var correlationId = context.Headers.Get<string>("X-Correlation-ID") ?? Activity.Current?.TraceId.ToString() ?? "n/a";
-        using var scope = _logger.BeginScope(new Dictionary<string, object?> { ["CorrelationId"] = correlationId });
-        _logger.LogWarning("Notification event InventoryReservationFailedEvent CorrelationId {CorrelationId} OrderId {OrderId} ProductId {ProductId} Quantity {Quantity} Reason {Reason}", correlationId, context.Message.OrderId, context.Message.ProductId, context.Message.Quantity, context.Message.Reason);
+        _logger.LogInformation("Notification Sent: Order {OrderId} has been placed successfully", context.Message.Id);
         return Task.CompletedTask;
     }
 }

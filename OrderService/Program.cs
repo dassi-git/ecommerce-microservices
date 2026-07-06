@@ -2,18 +2,25 @@ using MassTransit;
 using Microsoft.EntityFrameworkCore;
 using OrderService.Data;
 using OrderService.Models;
+using Serilog;
+using Serilog.Context;
 using Shared.Contracts;
 using System.Diagnostics;
 
 var builder = WebApplication.CreateBuilder(args);
 
+Log.Logger = new LoggerConfiguration()
+    .Enrich.FromLogContext()
+    .Enrich.WithProperty("Application", "OrderService")
+    .WriteTo.Console()
+    .CreateLogger();
+
+builder.Host.UseSerilog();
+
 builder.Services.AddOpenApi();
 builder.Services.AddHealthChecks();
 builder.Logging.ClearProviders();
-builder.Logging.AddJsonConsole(options =>
-{
-    options.IncludeScopes = true;
-});
+builder.Logging.AddSerilog();
 
 var messagingEnabled = builder.Configuration.GetValue("Messaging:Enabled", false);
 
@@ -31,12 +38,17 @@ builder.Services.AddDbContext<OrderDbContext>(options =>
 
 builder.Services.AddMassTransit(x =>
 {
+    x.SetKebabCaseEndpointNameFormatter();
+    x.AddConsumer<InventoryReservedConsumer>();
+    x.AddConsumer<InventoryRejectedConsumer>();
     x.UsingRabbitMq((context, cfg) =>
     {
         cfg.Host("rabbitmq", "/", h => {
             h.Username("guest");
             h.Password("guest");
         });
+        cfg.UseMessageRetry(r => r.Interval(3, TimeSpan.FromSeconds(5)));
+        cfg.ConfigureEndpoints(context);
     });
 });
 if (!messagingEnabled)
@@ -57,8 +69,11 @@ app.Use(async (context, next) =>
     context.Items["CorrelationId"] = correlationId;
     context.Response.Headers["X-Correlation-ID"] = correlationId;
 
-    using var scope = app.Logger.BeginScope(new Dictionary<string, object?> { ["CorrelationId"] = correlationId });
-    await next();
+    using (Serilog.Context.LogContext.PushProperty("CorrelationId", correlationId))
+    {
+        using var scope = app.Logger.BeginScope(new Dictionary<string, object?> { ["CorrelationId"] = correlationId });
+        await next();
+    }
 });
 
 app.MapGet("/health", () => Results.Ok(new { status = "Healthy", service = "OrderService" }));
@@ -92,6 +107,10 @@ app.MapPost("/api/orders", async (HttpContext httpContext, CreateOrderRequest re
     if (publisher is not null)
     {
         await publisher.Publish(new OrderCreatedEvent(order.Id, order.ProductId, order.Quantity, DateTime.UtcNow), context =>
+        {
+            context.Headers.Set("X-Correlation-ID", correlationId);
+        });
+        await publisher.Publish(new OrderPlacedEvent(order.Id, order.ProductId, order.Quantity), context =>
         {
             context.Headers.Set("X-Correlation-ID", correlationId);
         });
@@ -130,12 +149,12 @@ public static class CorrelationHelpers
     }
 }
 
-public class OrderStatusConsumer : IConsumer<InventoryReservedEvent>, IConsumer<InventoryReservationFailedEvent>
+public class InventoryReservedConsumer : IConsumer<InventoryReservedEvent>
 {
     private readonly OrderDbContext _db;
-    private readonly ILogger<OrderStatusConsumer> _logger;
+    private readonly ILogger<InventoryReservedConsumer> _logger;
 
-    public OrderStatusConsumer(OrderDbContext db, ILogger<OrderStatusConsumer> logger)
+    public InventoryReservedConsumer(OrderDbContext db, ILogger<InventoryReservedConsumer> logger)
     {
         _db = db;
         _logger = logger;
@@ -144,30 +163,48 @@ public class OrderStatusConsumer : IConsumer<InventoryReservedEvent>, IConsumer<
     public async Task Consume(ConsumeContext<InventoryReservedEvent> context)
     {
         var correlationId = context.Headers.Get<string>("X-Correlation-ID") ?? Activity.Current?.TraceId.ToString() ?? "n/a";
-        var order = await _db.Orders.FindAsync(context.Message.OrderId);
-        if (order is null)
+        using (Serilog.Context.LogContext.PushProperty("CorrelationId", correlationId))
         {
-            _logger.LogWarning("Order {OrderId} not found while handling reservation for correlation {CorrelationId}", context.Message.OrderId, correlationId);
-            return;
-        }
+            var order = await _db.Orders.FindAsync(context.Message.OrderId);
+            if (order is null)
+            {
+                _logger.LogWarning("Order {OrderId} not found while handling reservation for correlation {CorrelationId}", context.Message.OrderId, correlationId);
+                return;
+            }
 
-        order.Status = "Confirmed";
-        await _db.SaveChangesAsync();
-        _logger.LogInformation("Order {OrderId} confirmed for correlation {CorrelationId}", order.Id, correlationId);
+            order.Status = "Confirmed";
+            await _db.SaveChangesAsync();
+            _logger.LogInformation("Order {OrderId} confirmed for correlation {CorrelationId}", order.Id, correlationId);
+        }
+    }
+}
+
+public class InventoryRejectedConsumer : IConsumer<InventoryRejectedEvent>
+{
+    private readonly OrderDbContext _db;
+    private readonly ILogger<InventoryRejectedConsumer> _logger;
+
+    public InventoryRejectedConsumer(OrderDbContext db, ILogger<InventoryRejectedConsumer> logger)
+    {
+        _db = db;
+        _logger = logger;
     }
 
-    public async Task Consume(ConsumeContext<InventoryReservationFailedEvent> context)
+    public async Task Consume(ConsumeContext<InventoryRejectedEvent> context)
     {
         var correlationId = context.Headers.Get<string>("X-Correlation-ID") ?? Activity.Current?.TraceId.ToString() ?? "n/a";
-        var order = await _db.Orders.FindAsync(context.Message.OrderId);
-        if (order is null)
+        using (Serilog.Context.LogContext.PushProperty("CorrelationId", correlationId))
         {
-            _logger.LogWarning("Order {OrderId} not found while handling failure for correlation {CorrelationId}", context.Message.OrderId, correlationId);
-            return;
-        }
+            var order = await _db.Orders.FindAsync(context.Message.OrderId);
+            if (order is null)
+            {
+                _logger.LogWarning("Order {OrderId} not found while handling rejection for correlation {CorrelationId}", context.Message.OrderId, correlationId);
+                return;
+            }
 
-        order.Status = "Rejected";
-        await _db.SaveChangesAsync();
-        _logger.LogInformation("Order {OrderId} rejected for correlation {CorrelationId} because {Reason}", order.Id, correlationId, context.Message.Reason);
+            order.Status = "Cancelled";
+            await _db.SaveChangesAsync();
+            _logger.LogInformation("Order {OrderId} cancelled for correlation {CorrelationId} because {Reason}", order.Id, correlationId, context.Message.Reason);
+        }
     }
 }

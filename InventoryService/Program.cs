@@ -34,7 +34,7 @@ if (messagingEnabled)
     builder.Services.AddMassTransit(x =>
     {
         x.SetKebabCaseEndpointNameFormatter();
-        x.AddConsumer<InventoryReservationConsumer>();
+        x.AddConsumer<OrderPlacedConsumer>();
         x.UsingRabbitMq((context, cfg) =>
         {
             cfg.Host("rabbitmq", "/", h =>
@@ -105,27 +105,28 @@ public static class CorrelationHelpers
     }
 }
 
-public class InventoryReservationConsumer : IConsumer<OrderCreatedEvent>
+public class OrderPlacedConsumer : IConsumer<OrderPlacedEvent>
 {
     private readonly InventoryDbContext _db;
     private readonly IPublishEndpoint _publisher;
-    private readonly ILogger<InventoryReservationConsumer> _logger;
+    private readonly ILogger<OrderPlacedConsumer> _logger;
 
-    public InventoryReservationConsumer(InventoryDbContext db, IPublishEndpoint publisher, ILogger<InventoryReservationConsumer> logger)
+    public OrderPlacedConsumer(InventoryDbContext db, IPublishEndpoint publisher, ILogger<OrderPlacedConsumer> logger)
     {
         _db = db;
         _publisher = publisher;
         _logger = logger;
     }
 
-    public async Task Consume(ConsumeContext<OrderCreatedEvent> context)
+    public async Task Consume(ConsumeContext<OrderPlacedEvent> context)
     {
         var correlationId = context.Headers.Get<string>("X-Correlation-ID") ?? Activity.Current?.TraceId.ToString() ?? "n/a";
         var item = await _db.InventoryItems.FirstOrDefaultAsync(i => i.ProductId == context.Message.ProductId);
+
         if (item is null || item.Stock < context.Message.Quantity)
         {
             _logger.LogWarning("Inventory reservation failed for order {OrderId} correlation {CorrelationId}", context.Message.OrderId, correlationId);
-            await _publisher.Publish(new InventoryReservationFailedEvent(context.Message.OrderId, context.Message.ProductId, context.Message.Quantity, "Insufficient stock", DateTime.UtcNow), messageContext =>
+            await _publisher.Publish(new InventoryRejectedEvent(context.Message.OrderId, context.Message.ProductId, context.Message.Quantity, "Insufficient stock", DateTime.UtcNow), messageContext =>
             {
                 messageContext.Headers.Set("X-Correlation-ID", correlationId);
             });
